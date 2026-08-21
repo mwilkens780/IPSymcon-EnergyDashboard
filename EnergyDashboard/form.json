@@ -1,0 +1,62 @@
+{
+  "elements": [
+    {
+      "type": "NumberSpinner",
+      "name": "update_interval",
+      "caption": "Aktualisierungsintervall (Sekunden)",
+      "minimum": 30,
+      "suffix": "s"
+    },
+    {
+      "type": "SelectInstance",
+      "name": "archive_instance",
+      "caption": "Archiv-Instanz (fuer Leistungs-/Verbrauchsverlaeufe)",
+      "validModules": ["{43192F0B-135B-4CE7-A0A7-1475603F3060}"]
+    },
+    {
+      "type": "Label",
+      "caption": "Alle Variablen bitte einmalig zuweisen -- es gibt keine sinnvollen Standardwerte, da Solaranlage und Stromzaehler pro Installation unterschiedliche Objekt-IDs haben."
+    },
+    {
+      "type": "ExpansionPanel",
+      "caption": "Solaranlage (OpenDTU)",
+      "expanded": true,
+      "items": [
+        { "type": "SelectVariable", "name": "var_pv_power_ac",     "caption": "Leistung AC (W)" },
+        { "type": "SelectVariable", "name": "var_pv_power_dc",     "caption": "Leistung DC (W)" },
+        { "type": "SelectVariable", "name": "var_pv_voltage",      "caption": "Spannung (V)" },
+        { "type": "SelectVariable", "name": "var_pv_current",      "caption": "Strom (A)" },
+        { "type": "SelectVariable", "name": "var_pv_frequency",    "caption": "Frequenz (Hz)" },
+        { "type": "SelectVariable", "name": "var_pv_efficiency",   "caption": "Effizienz (%)" },
+        { "type": "SelectVariable", "name": "var_pv_temperature",  "caption": "Wechselrichter-Temperatur (°C)" },
+        { "type": "SelectVariable", "name": "var_pv_energy_today", "caption": "Energie heute (Wh)" },
+        { "type": "SelectVariable", "name": "var_pv_energy_total", "caption": "Energie gesamt (kWh)" },
+        { "type": "SelectVariable", "name": "var_pv_producing",    "caption": "Wechselrichter produziert" },
+        { "type": "SelectVariable", "name": "var_pv_reachable",    "caption": "Wechselrichter erreichbar" },
+        { "type": "SelectVariable", "name": "var_pv_online",       "caption": "OpenDTU Online-Status" },
+        { "type": "SelectVariable", "name": "var_pv_limit_relative", "caption": "Leistungsbegrenzung relativ (%)", "requiredAction": 1 }
+      ]
+    },
+    {
+      "type": "ExpansionPanel",
+      "caption": "Stromzaehler",
+      "expanded": true,
+      "items": [
+        { "type": "SelectVariable", "name": "var_meter_energy_total", "caption": "Zaehlerstand gesamt (Wh, fortlaufend)" },
+        { "type": "SelectVariable", "name": "var_meter_power", "caption": "Aktuelle Leistung (W, optional -- ohne Auswahl wird sie aus dem Zaehlerstand hergeleitet)" }
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "type": "Button",
+      "caption": "Jetzt aktualisieren",
+      "onClick": "END_Refresh($id);"
+    }
+  ],
+  "status": [
+    { "code": 102, "icon": "active",   "caption": "Aktiv" },
+    { "code": 200, "icon": "error",    "caption": "Fehler – Details im IPS-Log" },
+    { "code": 201, "icon": "inactive", "caption": "Nicht konfiguriert – Variablen in den Einstellungen auswaehlen" }
+  ]
+}

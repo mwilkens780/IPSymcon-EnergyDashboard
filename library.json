@@ -1,0 +1,10 @@
+{
+    "id": "{14F5B6D5-D359-4D03-B72A-76D1E689E545}",
+    "author": "Martin Wilkens",
+    "name": "Energy Dashboard",
+    "description": "Grafisches Solar- und Stromverbrauchs-Dashboard fuer IP-Symcon: OpenDTU-Kennzahlen, Ertragsverlaeufe, Stromzaehler-Verbrauch als Balkendiagramme und interaktive Leistungsbegrenzung in einer HTML-SDK-Kachel.",
+    "version": "1.0",
+    "build": 1,
+    "date": 1787318389,
+    "url": "https://github.com/mwilkens780/IPSymcon-EnergyDashboard"
+}

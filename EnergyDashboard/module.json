@@ -1,0 +1,12 @@
+{
+    "id": "{14F5B6D5-D359-4D03-B72A-76D1E689E545}",
+    "name": "Energy Dashboard",
+    "type": 3,
+    "vendor": "Martin Wilkens",
+    "aliases": [],
+    "dependencies": [],
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": [],
+    "prefix": "END"
+}
