@@ -8,6 +8,8 @@ class EnergyDashboard extends IPSModule
     private const DIAL_RANGES = [
         'pv_limit' => [0.0, 100.0, 1.0],
     ];
+    // Balkonkraftwerk: gesetzliche Einspeisegrenze.
+    private const PV_LIMIT_WATT = 800.0;
 
     // ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -210,16 +212,79 @@ class EnergyDashboard extends IPSModule
         return isset($oldest['Value']) ? (float) $oldest['Value'] : null;
     }
 
-    private function periodUsage(int $varId, int $periodStart, ?float $current): ?float
+    /**
+     * Delta of an ever-increasing counter between two points in time. $end
+     * close to "now" reads the live value instead of the (possibly lagging)
+     * archive, everything else is resolved from the archive -- this is what
+     * makes "previous period" (e.g. last month, bounded on both ends in the
+     * past) possible without waiting for a rollover to be observed live,
+     * unlike the Heating Dashboard's period_prev tracking.
+     */
+    private function counterDelta(int $varId, int $start, int $end): ?float
     {
-        if ($current === null) {
-            return null;
-        }
-        $base = $this->counterAtOrAfter($varId, $periodStart);
+        $base = $this->counterAtOrAfter($varId, $start);
         if ($base === null) {
             return null;
         }
-        return max(0.0, $current - $base);
+        $endVal = ($end >= time() - 60) ? $this->readVarById($varId) : $this->counterAtOrAfter($varId, $end);
+        if ($endVal === null) {
+            return null;
+        }
+        return max(0.0, (float) $endVal - $base);
+    }
+
+    /** Per-calendar-day maximum of a daily-resetting counter (e.g. "Energie heute") within [start,end]. */
+    private function dailyMaxByDay(int $varId, int $start, int $end): array
+    {
+        $archiveID = $this->ReadPropertyInteger('archive_instance');
+        if ($archiveID <= 0 || $varId <= 0 || !function_exists('AC_GetLoggedValues')) {
+            return [];
+        }
+        try {
+            $rows = @AC_GetLoggedValues($archiveID, $varId, $start, $end, 0);
+        } catch (\Throwable $e) {
+            return [];
+        }
+        if (!is_array($rows)) {
+            return [];
+        }
+        $byDay = [];
+        foreach ($rows as $row) {
+            if (!isset($row['TimeStamp'], $row['Value'])) {
+                continue;
+            }
+            $day = date('Y-m-d', (int) $row['TimeStamp']);
+            $val = (float) $row['Value'];
+            if (!isset($byDay[$day]) || $val > $byDay[$day]) {
+                $byDay[$day] = $val;
+            }
+        }
+        return $byDay;
+    }
+
+    /** Sum of daily maxima within [start,end] -- period total for a daily-resetting yield counter. */
+    private function yieldForRange(int $varId, int $start, int $end): ?float
+    {
+        $byDay = $this->dailyMaxByDay($varId, $start, $end);
+        return count($byDay) > 0 ? array_sum($byDay) : null;
+    }
+
+    /** [{label, value(kWh)}] for the last 7 calendar days, oldest first. */
+    private function last7DaysYield(int $varId): array
+    {
+        $todayStart = strtotime('today');
+        $start      = strtotime('-6 days', $todayStart);
+        $byDay      = $this->dailyMaxByDay($varId, $start, time());
+
+        $names = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+        $out   = [];
+        for ($i = 6; $i >= 0; $i--) {
+            $dayTs = strtotime("-{$i} days", $todayStart);
+            $day   = date('Y-m-d', $dayTs);
+            $label = $i === 0 ? 'Heute' : $names[(int) date('w', $dayTs)];
+            $out[] = ['label' => $label, 'value' => isset($byDay[$day]) ? $byDay[$day] / 1000.0 : null];
+        }
+        return $out;
     }
 
     private function whToKwh(?float $wh): ?float
@@ -257,6 +322,82 @@ class EnergyDashboard extends IPSModule
         return ['points' => implode(' ', $pts), 'min' => $realMin, 'max' => $realMax];
     }
 
+    /**
+     * Like chartData() but scaled 0..max(observed, PV_LIMIT_WATT) so the
+     * 800W Balkonkraftwerk-Grenze is always visible, and split into
+     * red/green polyline segments at the threshold (with the crossing
+     * point linearly interpolated so the color change lands exactly on
+     * the line, not at a jagged data-point boundary).
+     */
+    private function pvChartGeometry(array $series): array
+    {
+        if (count($series) < 2) {
+            return ['segments' => [], 'thresholdY' => null, 'min' => null, 'max' => null];
+        }
+        $startTs = time() - self::CHART_SPAN_SEC;
+        $values  = array_column($series, 1);
+        $realMin = min($values);
+        $realMax = max($values);
+        $scaleMax = max($realMax, self::PV_LIMIT_WATT) * 1.1;
+        if ($scaleMax <= 0) {
+            $scaleMax = self::PV_LIMIT_WATT * 1.1;
+        }
+        $scaleMin = 0.0;
+
+        $toXY = function (float $ts, float $val) use ($startTs, $scaleMin, $scaleMax): array {
+            $x = max(0.0, min(300.0, ($ts - $startTs) / self::CHART_SPAN_SEC * 300.0));
+            $y = 60.0 - (($val - $scaleMin) / ($scaleMax - $scaleMin)) * 60.0;
+            return [$x, $y];
+        };
+
+        $segments = [];
+        $current  = null;
+        $n        = count($series);
+        for ($i = 0; $i < $n; $i++) {
+            [$ts, $val] = $series[$i];
+            $xy    = $toXY((float) $ts, $val);
+            $color = $val > self::PV_LIMIT_WATT ? 'red' : 'green';
+            if ($current === null) {
+                $current = ['color' => $color, 'pts' => [$xy]];
+                continue;
+            }
+            if ($color !== $current['color']) {
+                [$prevTs, $prevVal] = $series[$i - 1];
+                $denom = $val - $prevVal;
+                if (abs($denom) > 1e-9) {
+                    $frac    = max(0.0, min(1.0, (self::PV_LIMIT_WATT - $prevVal) / $denom));
+                    $crossTs = $prevTs + $frac * ($ts - $prevTs);
+                    $cxy     = $toXY($crossTs, self::PV_LIMIT_WATT);
+                    $current['pts'][] = $cxy;
+                    $segments[] = $current;
+                    $current = ['color' => $color, 'pts' => [$cxy, $xy]];
+                } else {
+                    $segments[] = $current;
+                    $current = ['color' => $color, 'pts' => [$xy]];
+                }
+            } else {
+                $current['pts'][] = $xy;
+            }
+        }
+        if ($current !== null) {
+            $segments[] = $current;
+        }
+
+        [, $thresholdY] = $toXY((float) $startTs, self::PV_LIMIT_WATT);
+
+        return [
+            'segments' => array_map(static function (array $s): array {
+                return [
+                    'color'  => $s['color'],
+                    'points' => implode(' ', array_map(static fn (array $p) => round($p[0], 1) . ',' . round($p[1], 1), $s['pts'])),
+                ];
+            }, $segments),
+            'thresholdY' => round($thresholdY, 1),
+            'min' => $realMin,
+            'max' => $realMax,
+        ];
+    }
+
     /** Thumb (x,y) on the 120x120/r45/center60,60 dial arc for a value in [min,max]. */
     private function dialThumbPos(float $value, float $min, float $max): array
     {
@@ -272,6 +413,8 @@ class EnergyDashboard extends IPSModule
         $meterEnergyId = $this->ReadPropertyInteger('var_meter_energy_total');
         $meterEnergy   = $this->readVarById($meterEnergyId);
         $meterPowerId  = $this->ReadPropertyInteger('var_meter_power');
+        $energyTodayId = $this->ReadPropertyInteger('var_pv_energy_today');
+        $energyToday   = $this->readVarById($energyTodayId);
 
         $meterPowerCurrent = null;
         if ($meterPowerId > 0) {
@@ -283,10 +426,18 @@ class EnergyDashboard extends IPSModule
             }
         }
 
-        $todayStart = strtotime('today');
-        $weekStart  = strtotime('monday this week', $todayStart);
-        $monthStart = strtotime('first day of this month', $todayStart);
-        $meterCur   = $meterEnergy !== null ? (float) $meterEnergy : null;
+        $todayStart     = strtotime('today');
+        $yesterdayStart = strtotime('-1 day', $todayStart);
+        $weekStart      = strtotime('monday this week', $todayStart);
+        $lastWeekStart  = strtotime('-7 days', $weekStart);
+        $monthStart     = strtotime('first day of this month', $todayStart);
+        $lastMonthStart = strtotime('first day of last month', $todayStart);
+        $thisYear       = (int) date('Y', $todayStart);
+        $yearStart      = mktime(0, 0, 0, 1, 1, $thisYear);
+        $lastYearStart  = mktime(0, 0, 0, 1, 1, $thisYear - 1);
+        $now            = time();
+        $meterCur       = $meterEnergy !== null ? (float) $meterEnergy : null;
+        $prodDayCur     = $energyToday !== null ? (float) $energyToday : null;
 
         return [
             'pvPowerAc'    => $pvPowerAc !== null ? (float) $pvPowerAc : null,
@@ -296,7 +447,7 @@ class EnergyDashboard extends IPSModule
             'pvFrequency'  => $this->readVar('var_pv_frequency'),
             'pvEfficiency' => $this->readVar('var_pv_efficiency'),
             'pvTemperature' => $this->readVar('var_pv_temperature'),
-            'pvEnergyToday' => $this->readVar('var_pv_energy_today'),
+            'pvEnergyToday' => $energyToday,
             'pvEnergyTotal' => $this->readVar('var_pv_energy_total'),
             'pvProducing'  => (bool) $this->readVar('var_pv_producing'),
             'pvReachable'  => (bool) $this->readVar('var_pv_reachable'),
@@ -305,10 +456,31 @@ class EnergyDashboard extends IPSModule
 
             'meterEnergyTotal'  => $meterCur,
             'meterPowerCurrent' => $meterPowerCurrent !== null ? (float) $meterPowerCurrent : null,
-            // periodUsage() returns Wh (same unit as the counter) -- convert to kWh for display.
-            'meterUsageDay'     => $this->whToKwh($this->periodUsage($meterEnergyId, $todayStart, $meterCur)),
-            'meterUsageWeek'    => $this->whToKwh($this->periodUsage($meterEnergyId, $weekStart, $meterCur)),
-            'meterUsageMonth'   => $this->whToKwh($this->periodUsage($meterEnergyId, $monthStart, $meterCur)),
+
+            // Netzbezug: counterDelta() reads a true continuous counter, so
+            // "previous period" is a direct archive lookup -- no rollover
+            // detection needed (unlike the Heating Dashboard's meter).
+            'meterUsageDay'      => $this->whToKwh($this->counterDelta($meterEnergyId, $todayStart, $now)),
+            'meterUsageWeek'     => $this->whToKwh($this->counterDelta($meterEnergyId, $weekStart, $now)),
+            'meterUsageMonth'    => $this->whToKwh($this->counterDelta($meterEnergyId, $monthStart, $now)),
+            'meterUsageYear'     => $this->whToKwh($this->counterDelta($meterEnergyId, $yearStart, $now)),
+            'meterUsagePrevDay'  => $this->whToKwh($this->counterDelta($meterEnergyId, $yesterdayStart, $todayStart)),
+            'meterUsagePrevWeek' => $this->whToKwh($this->counterDelta($meterEnergyId, $lastWeekStart, $weekStart)),
+            'meterUsagePrevMonth' => $this->whToKwh($this->counterDelta($meterEnergyId, $lastMonthStart, $monthStart)),
+            'meterUsagePrevYear' => $this->whToKwh($this->counterDelta($meterEnergyId, $lastYearStart, $yearStart)),
+
+            // Produktion: "Energie heute" resets daily, so periods are summed
+            // from daily maxima instead of a simple counter delta.
+            'prodDay'      => $this->whToKwh($prodDayCur),
+            'prodWeek'     => $this->whToKwh($this->yieldForRange($energyTodayId, $weekStart, $now)),
+            'prodMonth'    => $this->whToKwh($this->yieldForRange($energyTodayId, $monthStart, $now)),
+            'prodYear'     => $this->whToKwh($this->yieldForRange($energyTodayId, $yearStart, $now)),
+            'prodPrevDay'  => $this->whToKwh($this->yieldForRange($energyTodayId, $yesterdayStart, $todayStart)),
+            'prodPrevWeek' => $this->whToKwh($this->yieldForRange($energyTodayId, $lastWeekStart, $weekStart)),
+            'prodPrevMonth' => $this->whToKwh($this->yieldForRange($energyTodayId, $lastMonthStart, $monthStart)),
+            'prodPrevYear' => $this->whToKwh($this->yieldForRange($energyTodayId, $lastYearStart, $yearStart)),
+
+            'dailyYield' => $this->last7DaysYield($energyTodayId),
 
             'histPvPower'    => $this->archivedSeries($this->ReadPropertyInteger('var_pv_power_ac'), self::CHART_SPAN_SEC),
             'histMeterPower' => $meterPowerId > 0
@@ -351,6 +523,33 @@ class EnergyDashboard extends IPSModule
             . '</div></div>';
     }
 
+    /** PV power 6h chart with the 800W limit line and red/green segments -- see pvChartGeometry(). */
+    private function renderPvPowerChart(string $id, string $label, array $series): string
+    {
+        $geo    = $this->pvChartGeometry($series);
+        $maxStr = $geo['max'] !== null ? $this->fmtNum($geo['max'], 0) . ' W' : '';
+        $minStr = $geo['min'] !== null ? $this->fmtNum($geo['min'], 0) . ' W' : '';
+
+        $polylines = '';
+        foreach ($geo['segments'] as $seg) {
+            $stroke = $seg['color'] === 'red' ? '#e0575a' : '#5ecb82';
+            $polylines .= "<polyline points=\"{$seg['points']}\" fill=\"none\" stroke=\"{$stroke}\" stroke-width=\"2\"/>";
+        }
+        $thresholdLine = $geo['thresholdY'] !== null
+            ? "<line x1=\"0\" y1=\"{$geo['thresholdY']}\" x2=\"300\" y2=\"{$geo['thresholdY']}\" stroke=\"#ffb020\" stroke-width=\"1\" stroke-dasharray=\"4,3\"/>"
+            : '';
+
+        return "<div class=\"chart-wrap\"><div class=\"chart-label\">{$label}</div>"
+            . '<div class="chart-inner">'
+            . "<svg id=\"{$id}_svg\" viewBox=\"0 0 300 60\" preserveAspectRatio=\"none\">"
+            . "{$thresholdLine}<g id=\"{$id}_lines\">{$polylines}</g>"
+            . '</svg>'
+            . "<span id=\"{$id}_max\" class=\"chart-max\">{$maxStr}</span>"
+            . "<span id=\"{$id}_min\" class=\"chart-min\">{$minStr}</span>"
+            . '<span class="chart-limit">800 W Grenze</span>'
+            . '</div></div>';
+    }
+
     private function renderDial(string $ident, string $label, ?float $value): string
     {
         [$min, $max, $step] = self::DIAL_RANGES[$ident];
@@ -369,23 +568,49 @@ class EnergyDashboard extends IPSModule
             . '</div>';
     }
 
-    private function renderBarChart(string $label, string $unit, ?float $day, ?float $week, ?float $month): string
+    /** $periods: ['Tag' => ['v' => ?float, 'prev' => ?float], 'Woche' => [...], 'Monat' => [...], 'Jahr' => [...]]. */
+    private function renderBarChart(string $label, array $periods): string
     {
-        $localMax = max(array_filter([$day, $week, $month], static fn ($v) => $v !== null)) ?: 1.0;
+        $vals     = array_filter(array_map(static fn (array $p) => $p['v'], $periods), static fn ($v) => $v !== null);
+        $localMax = count($vals) > 0 ? max($vals) : 1.0;
 
         $bars = '';
-        foreach (['Tag' => $day, 'Woche' => $week, 'Monat' => $month] as $xlabel => $v) {
-            $h    = $v !== null ? max(2, (int) round(($v / $localMax) * 60)) : 2;
-            $vStr = $v !== null ? $this->fmtNum($v, 1) : '–';
-            $bars .= "<div class='bar-col'><div class='bar-value'>{$vStr}</div>"
+        foreach ($periods as $xlabel => $p) {
+            $v       = $p['v'];
+            $prev    = $p['prev'];
+            $h       = $v !== null ? max(2, (int) round(($v / $localMax) * 60)) : 2;
+            $vStr    = $v !== null ? $this->fmtNum($v, 1) : '–';
+            $prevStr = $prev !== null ? '(' . $this->fmtNum($prev, 1) . ')' : '';
+            $bars .= "<div class='bar-col'><div class='bar-value'>{$vStr}</div><div class='bar-prev'>{$prevStr}</div>"
                 . "<div class='bar-track'><div class='bar-fill-v' style='height:{$h}px'></div></div>"
                 . "<div class='bar-xlabel'>{$xlabel}</div></div>";
         }
 
         $labelEsc = htmlspecialchars($label, ENT_QUOTES);
         return "<div class=\"chart-card\"><div class=\"chart-card-label\">{$labelEsc}</div>"
-            . "<div class=\"bar-row\">{$bars}</div>"
-            . "<div class=\"chart-card-year\">Einheit: {$unit}</div></div>";
+            . "<div class=\"bar-row\">{$bars}</div></div>";
+    }
+
+    /** $series: [{label, value}] -- N columns, no previous-period comparison. */
+    private function renderDailyBarChart(string $label, array $series): string
+    {
+        $vals     = array_filter(array_map(static fn (array $p) => $p['value'], $series), static fn ($v) => $v !== null);
+        $localMax = count($vals) > 0 ? max($vals) : 1.0;
+
+        $bars = '';
+        foreach ($series as $p) {
+            $v        = $p['value'];
+            $h        = $v !== null ? max(2, (int) round(($v / $localMax) * 60)) : 2;
+            $vStr     = $v !== null ? $this->fmtNum($v, 1) : '–';
+            $labelEsc = htmlspecialchars($p['label'], ENT_QUOTES);
+            $bars .= "<div class='bar-col'><div class='bar-value'>{$vStr}</div>"
+                . "<div class='bar-track'><div class='bar-fill-v' style='height:{$h}px'></div></div>"
+                . "<div class='bar-xlabel'>{$labelEsc}</div></div>";
+        }
+
+        $labelEsc2 = htmlspecialchars($label, ENT_QUOTES);
+        return "<div class=\"chart-card\"><div class=\"chart-card-label\">{$labelEsc2}</div>"
+            . "<div class=\"bar-row\">{$bars}</div></div>";
     }
 
     private function buildDashboardHTML(): string
@@ -399,7 +624,6 @@ class EnergyDashboard extends IPSModule
         $hzStr   = $d['pvFrequency'] !== null ? $this->fmtNum((float) $d['pvFrequency'], 2) . ' Hz' : '–';
         $effStr  = $d['pvEfficiency'] !== null ? $this->fmtNum((float) $d['pvEfficiency'], 1) . ' %' : '–';
         $tempStr = $d['pvTemperature'] !== null ? $this->fmtNum((float) $d['pvTemperature'], 1) . ' °C' : '–';
-        $todayStr = $d['pvEnergyToday'] !== null ? $this->fmtNum((float) $d['pvEnergyToday'], 0) . ' Wh' : '–';
         $totalStr = $d['pvEnergyTotal'] !== null ? $this->fmtNum((float) $d['pvEnergyTotal'], 2) . ' kWh' : '–';
 
         $meterTotalStr = $d['meterEnergyTotal'] !== null ? $this->fmtNum($d['meterEnergyTotal'] / 1000, 1) . ' kWh' : '–';
@@ -411,26 +635,38 @@ class EnergyDashboard extends IPSModule
         $producingBadge = $this->renderStatusBadge('producing_badge', '☀️ Produziert', $d['pvProducing']);
         $reachableBadge = $this->renderStatusBadge('reachable_badge', '📶 Erreichbar', $d['pvReachable']);
 
-        $pvTiles = $this->renderStatTile('cur_ac', 'Leistung AC', $acStr)
-            . $this->renderStatTile('cur_dc', 'Leistung DC', $dcStr)
+        // Solar-Leistung produziert / Leistung Netzbezug: paired stats + paired 6h charts.
+        $powerStats = $this->renderStatTile('cur_ac', 'Solar-Leistung produziert', $acStr)
+            . $this->renderStatTile('cur_meter_power', 'Leistung Netzbezug', $meterPowerStr);
+        $pvChart    = $this->renderPvPowerChart('chart_pv', 'Solar-Leistung 6h', $d['histPvPower']);
+        $meterChart = $this->renderMiniChart('chart_meter', 'Netzbezug 6h', $d['histMeterPower'], ' W');
+
+        $pvTiles = $this->renderStatTile('cur_dc', 'Leistung DC', $dcStr)
             . $this->renderStatTile('cur_v', 'Spannung', $vStr)
             . $this->renderStatTile('cur_a', 'Strom', $aStr)
             . $this->renderStatTile('cur_hz', 'Frequenz', $hzStr)
             . $this->renderStatTile('cur_eff', 'Effizienz', $effStr)
             . $this->renderStatTile('cur_temp', 'WR-Temperatur', $tempStr);
 
-        $energyTiles = $this->renderStatTile('cur_today', 'Energie heute', $todayStr)
-            . $this->renderStatTile('cur_total', 'Energie gesamt', $totalStr);
-
-        $pvChart    = $this->renderMiniChart('chart_pv', 'PV-Leistung AC 6h', $d['histPvPower'], ' W');
-        $meterChart = $this->renderMiniChart('chart_meter', 'Netzbezug 6h', $d['histMeterPower'], ' W');
-
         $pvDial = $this->renderDial('pv_limit', 'Leistungsbegrenzung', $d['pvLimit'] !== null ? (float) $d['pvLimit'] : null);
+        $pvTotalTile = $this->renderStatTile('cur_total', 'Energie gesamt', $totalStr);
 
-        $meterTiles = $this->renderStatTile('cur_meter_total', 'Zählerstand gesamt', $meterTotalStr)
-            . $this->renderStatTile('cur_meter_power', 'Aktuelle Leistung', $meterPowerStr);
+        $meterTile = $this->renderStatTile('cur_meter_total', 'Zählerstand gesamt', $meterTotalStr);
 
-        $meterBars = $this->renderBarChart('Stromverbrauch', 'kWh', $d['meterUsageDay'], $d['meterUsageWeek'], $d['meterUsageMonth']);
+        $dailyYieldChart = $this->renderDailyBarChart('Energie heute – letzte 7 Tage (kWh)', $d['dailyYield']);
+
+        $meterBars = $this->renderBarChart('Netzbezug (kWh)', [
+            'Tag'   => ['v' => $d['meterUsageDay'],   'prev' => $d['meterUsagePrevDay']],
+            'Woche' => ['v' => $d['meterUsageWeek'],  'prev' => $d['meterUsagePrevWeek']],
+            'Monat' => ['v' => $d['meterUsageMonth'], 'prev' => $d['meterUsagePrevMonth']],
+            'Jahr'  => ['v' => $d['meterUsageYear'],  'prev' => $d['meterUsagePrevYear']],
+        ]);
+        $prodBars = $this->renderBarChart('Solar-Produktion (kWh)', [
+            'Tag'   => ['v' => $d['prodDay'],   'prev' => $d['prodPrevDay']],
+            'Woche' => ['v' => $d['prodWeek'],  'prev' => $d['prodPrevWeek']],
+            'Monat' => ['v' => $d['prodMonth'], 'prev' => $d['prodPrevMonth']],
+            'Jahr'  => ['v' => $d['prodYear'],  'prev' => $d['prodPrevYear']],
+        ]);
 
         $updatedEsc = htmlspecialchars($d['updated'], ENT_QUOTES);
         $initJson   = json_encode($d);
@@ -452,11 +688,9 @@ body{overflow-y:auto;overflow-x:hidden;font-family:-apple-system,BlinkMacSystemF
 .status-row{display:flex;gap:6px;flex-wrap:wrap;flex:none}
 .section-label{font-size:11px;font-weight:700;color:#8aa8c8;text-transform:uppercase;letter-spacing:.04em;flex:none;border-bottom:1px solid #1e3a5f;padding-bottom:3px}
 .current-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;flex:none}
-.energy-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;flex:none}
 .cur-tile{display:flex;flex-direction:column;gap:1px;background:#131f33;border-radius:8px;padding:6px 8px}
 .cur-label{font-size:10px;color:#4a6a8a;text-transform:uppercase;letter-spacing:.03em}
 .cur-value{font-size:15px;font-weight:700;color:#d0e8ff}
-.charts-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;flex:none}
 .chart-wrap{flex:none;display:flex;flex-direction:column;gap:2px}
 .chart-label{font-size:9px;color:#4a6a8a;text-transform:uppercase;letter-spacing:.02em}
 .chart-inner{position:relative}
@@ -464,9 +698,11 @@ body{overflow-y:auto;overflow-x:hidden;font-family:-apple-system,BlinkMacSystemF
 .chart-max,.chart-min{position:absolute;right:3px;font-size:8px;color:#7ec8f0;background:rgba(13,27,42,.7);padding:0 3px;border-radius:3px}
 .chart-max{top:2px}
 .chart-min{bottom:2px}
+.chart-limit{position:absolute;left:3px;bottom:2px;font-size:8px;color:#ffb020;background:rgba(13,27,42,.7);padding:0 3px;border-radius:3px}
 .pv-block{display:flex;flex-direction:column;gap:6px;flex:none;background:#0f1c30;border-radius:10px;padding:8px}
 .pv-title{font-size:12px;font-weight:700;color:#d0e8ff}
-.pv-main-row{display:flex;align-items:center;justify-content:center;gap:14px}
+.power-stats{display:flex;flex-direction:column;gap:8px}
+.power-charts{display:flex;flex-direction:column;gap:8px}
 .dial-row{display:flex;gap:12px;justify-content:center}
 .dial{display:flex;flex-direction:column;align-items:center;gap:2px;width:100px;touch-action:none}
 .dial-svg{width:80px;height:80px;cursor:pointer}
@@ -477,10 +713,11 @@ body{overflow-y:auto;overflow-x:hidden;font-family:-apple-system,BlinkMacSystemF
 .bar-row{display:flex;justify-content:space-around;align-items:flex-end}
 .bar-col{display:flex;flex-direction:column;align-items:center;gap:2px}
 .bar-value{font-size:10px;font-weight:700;color:#d0e8ff}
+.bar-prev{font-size:8px;font-weight:400;color:#4a6a8a;min-height:10px}
 .bar-track{width:22px;height:60px;display:flex;align-items:flex-end}
 .bar-fill-v{width:100%;background:linear-gradient(180deg,#7ec8f0,#3a8abf);border-radius:3px 3px 0 0;transition:height .4s}
 .bar-xlabel{font-size:9px;color:#4a6a8a}
-.chart-card-year{font-size:10px;color:#4a6a8a;text-align:right}
+.consumption-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;flex:none}
 </style>
 </head>
 <body>
@@ -492,22 +729,31 @@ body{overflow-y:auto;overflow-x:hidden;font-family:-apple-system,BlinkMacSystemF
 <div class="status-row">{$producingBadge}{$reachableBadge}</div>
 
 <div class="pv-block">
-  <div class="pv-title">☀️ Solaranlage</div>
-  <div class="current-grid">{$pvTiles}</div>
-  <div class="energy-grid">{$energyTiles}</div>
-  <div class="pv-main-row">
+  <div class="pv-title">⚖️ Leistungsbilanz</div>
+  <div class="power-stats">{$powerStats}</div>
+  <div class="power-charts">
     {$pvChart}
-    <div class="dial-row">{$pvDial}</div>
+    {$meterChart}
   </div>
 </div>
 
 <div class="pv-block">
+  <div class="pv-title">☀️ Solaranlage</div>
+  <div class="current-grid">{$pvTiles}</div>
+  <div class="current-grid">{$pvTotalTile}</div>
+  <div class="dial-row">{$pvDial}</div>
+</div>
+
+{$dailyYieldChart}
+
+<div class="pv-block">
   <div class="pv-title">🔌 Stromzähler</div>
-  <div class="current-grid">{$meterTiles}</div>
-  <div class="charts-grid">
-    {$meterChart}
-    {$meterBars}
-  </div>
+  <div class="current-grid">{$meterTile}</div>
+</div>
+
+<div class="consumption-grid">
+  {$meterBars}
+  {$prodBars}
 </div>
 
 <script>
@@ -545,6 +791,67 @@ function renderMiniChart(prefix, series, unit) {
   function fmt(v) { return (v < 10 ? v.toFixed(1) : Math.round(v)).toString().replace('.', ',') + unit; }
   setText(prefix + '_max', fmt(realMax));
   setText(prefix + '_min', fmt(realMin));
+}
+
+// Mirrors PHP pvChartGeometry(): 800W-scaled, red/green segments with the crossing point interpolated.
+function renderPvChart(prefix, series) {
+  var g = document.getElementById(prefix + '_lines');
+  if (!g || !series || series.length < 2) return;
+  var LIMIT = 800;
+  var spanSec = 6 * 3600;
+  var startTs = Math.floor(Date.now() / 1000) - spanSec;
+  var vals = series.map(function(p) { return p[1]; });
+  var realMin = Math.min.apply(null, vals), realMax = Math.max.apply(null, vals);
+  var scaleMax = Math.max(realMax, LIMIT) * 1.1;
+  if (scaleMax <= 0) scaleMax = LIMIT * 1.1;
+  var scaleMin = 0;
+
+  function toXY(ts, val) {
+    var x = Math.max(0, Math.min(300, (ts - startTs) / spanSec * 300));
+    var y = 60 - ((val - scaleMin) / (scaleMax - scaleMin)) * 60;
+    return [x, y];
+  }
+
+  var segments = [];
+  var current = null;
+  for (var i = 0; i < series.length; i++) {
+    var ts = series[i][0], val = series[i][1];
+    var xy = toXY(ts, val);
+    var color = val > LIMIT ? 'red' : 'green';
+    if (current === null) {
+      current = { color: color, pts: [xy] };
+      continue;
+    }
+    if (color !== current.color) {
+      var prevTs = series[i - 1][0], prevVal = series[i - 1][1];
+      var denom = val - prevVal;
+      if (Math.abs(denom) > 1e-9) {
+        var frac = Math.max(0, Math.min(1, (LIMIT - prevVal) / denom));
+        var crossTs = prevTs + frac * (ts - prevTs);
+        var cxy = toXY(crossTs, LIMIT);
+        current.pts.push(cxy);
+        segments.push(current);
+        current = { color: color, pts: [cxy, xy] };
+      } else {
+        segments.push(current);
+        current = { color: color, pts: [xy] };
+      }
+    } else {
+      current.pts.push(xy);
+    }
+  }
+  if (current) segments.push(current);
+
+  var html = '';
+  segments.forEach(function(seg) {
+    var stroke = seg.color === 'red' ? '#e0575a' : '#5ecb82';
+    var pts = seg.pts.map(function(p) { return p[0].toFixed(1) + ',' + p[1].toFixed(1); }).join(' ');
+    html += '<polyline points="' + pts + '" fill="none" stroke="' + stroke + '" stroke-width="2"/>';
+  });
+  g.innerHTML = html;
+
+  setText(prefix + '_max', Math.round(realMax) + ' W');
+  setText(prefix + '_min', Math.round(realMin) + ' W');
 }
 
 function valueToThumb(value, min, max) {
@@ -627,7 +934,6 @@ window.handleMessage = function(raw) {
     setText('cur_hz', val.pvFrequency == null ? '–' : val.pvFrequency.toFixed(2).replace('.', ',') + ' Hz');
     setText('cur_eff', val.pvEfficiency == null ? '–' : val.pvEfficiency.toFixed(1).replace('.', ',') + ' %');
     setText('cur_temp', val.pvTemperature == null ? '–' : val.pvTemperature.toFixed(1).replace('.', ',') + ' °C');
-    setText('cur_today', val.pvEnergyToday == null ? '–' : Math.round(val.pvEnergyToday) + ' Wh');
     setText('cur_total', val.pvEnergyTotal == null ? '–' : val.pvEnergyTotal.toFixed(2).replace('.', ',') + ' kWh');
     setText('cur_meter_total', val.meterEnergyTotal == null ? '–' : (val.meterEnergyTotal / 1000).toFixed(1).replace('.', ',') + ' kWh');
     setText('cur_meter_power', val.meterPowerCurrent == null ? '–' : Math.round(val.meterPowerCurrent) + ' W');
@@ -648,7 +954,7 @@ window.handleMessage = function(raw) {
       reachableBadge.textContent = '📶 Erreichbar: ' + (val.pvReachable ? 'an' : 'aus');
     }
 
-    renderMiniChart('chart_pv', val.histPvPower, ' W');
+    renderPvChart('chart_pv', val.histPvPower);
     renderMiniChart('chart_meter', val.histMeterPower, ' W');
 
     if (val.pvLimit != null && dialRoots['pv_limit']) dialRoots['pv_limit']._updateVisual(val.pvLimit);
