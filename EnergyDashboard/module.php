@@ -222,6 +222,11 @@ class EnergyDashboard extends IPSModule
         return max(0.0, $current - $base);
     }
 
+    private function whToKwh(?float $wh): ?float
+    {
+        return $wh !== null ? $wh / 1000.0 : null;
+    }
+
     /** SVG polyline points + real min/max for a series, scaled into a 300x60 box. */
     private function chartData(array $series, float $viewW = 300.0, float $viewH = 60.0): array
     {
@@ -300,9 +305,10 @@ class EnergyDashboard extends IPSModule
 
             'meterEnergyTotal'  => $meterCur,
             'meterPowerCurrent' => $meterPowerCurrent !== null ? (float) $meterPowerCurrent : null,
-            'meterUsageDay'     => $this->periodUsage($meterEnergyId, $todayStart, $meterCur),
-            'meterUsageWeek'    => $this->periodUsage($meterEnergyId, $weekStart, $meterCur),
-            'meterUsageMonth'   => $this->periodUsage($meterEnergyId, $monthStart, $meterCur),
+            // periodUsage() returns Wh (same unit as the counter) -- convert to kWh for display.
+            'meterUsageDay'     => $this->whToKwh($this->periodUsage($meterEnergyId, $todayStart, $meterCur)),
+            'meterUsageWeek'    => $this->whToKwh($this->periodUsage($meterEnergyId, $weekStart, $meterCur)),
+            'meterUsageMonth'   => $this->whToKwh($this->periodUsage($meterEnergyId, $monthStart, $meterCur)),
 
             'histPvPower'    => $this->archivedSeries($this->ReadPropertyInteger('var_pv_power_ac'), self::CHART_SPAN_SEC),
             'histMeterPower' => $meterPowerId > 0
@@ -370,7 +376,7 @@ class EnergyDashboard extends IPSModule
         $bars = '';
         foreach (['Tag' => $day, 'Woche' => $week, 'Monat' => $month] as $xlabel => $v) {
             $h    = $v !== null ? max(2, (int) round(($v / $localMax) * 60)) : 2;
-            $vStr = $v !== null ? $this->fmtNum($v, $v < 10 ? 1 : 0) : '–';
+            $vStr = $v !== null ? $this->fmtNum($v, 1) : '–';
             $bars .= "<div class='bar-col'><div class='bar-value'>{$vStr}</div>"
                 . "<div class='bar-track'><div class='bar-fill-v' style='height:{$h}px'></div></div>"
                 . "<div class='bar-xlabel'>{$xlabel}</div></div>";
