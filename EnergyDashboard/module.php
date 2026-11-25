@@ -22,10 +22,9 @@ class EnergyDashboard extends IPSModule
         parent::Create();
 
         $this->RegisterPropertyInteger('update_interval', 60);
-        // Archive Control instance used to read power/consumption history --
-        // same instance as the WeatherDashboard module already uses on this
-        // installation, since there's normally only one per system.
-        $this->RegisterPropertyInteger('archive_instance', 59233);
+        // Archive Control instance used to read power/consumption history
+        // (normally only one per system; selected in the config form).
+        $this->RegisterPropertyInteger('archive_instance', 0);
 
         // No sensible defaults exist -- Solar/OpenDTU and the Stromzaehler
         // have installation-specific object IDs that couldn't be discovered

@@ -11,7 +11,7 @@ https://github.com/mwilkens780/IPSymcon-EnergyDashboard
 
 ## Konfiguration
 
-Anders als bei den anderen Dashboard-Modulen gibt es hier **keine vorbelegten Objekt-IDs** — Solaranlage und Stromzähler haben pro Installation unterschiedliche IDs, die sich nicht automatisch ermitteln ließen. Bitte in der Instanzkonfiguration einmalig alle Variablen zuweisen (OpenDTU-Instanz "Fuchsbau" bzw. die Stromzähler-Instanz).
+Es gibt **keine vorbelegten Objekt-IDs** — Solaranlage und Stromzähler haben pro Installation unterschiedliche IDs, die sich nicht automatisch ermitteln lassen. Bitte in der Instanzkonfiguration einmalig alle Variablen zuweisen (z. B. aus der OpenDTU-Instanz bzw. der Stromzähler-Instanz).
 
 Für die Verlaufs-/Verbrauchsdiagramme wird eine **Archiv-Instanz** benötigt (Standard: die bereits im System vorhandene Archive-Control-Instanz). "Leistung AC", "Energie heute" und der Stromzähler-Zählerstand sollten dort archiviert sein.
 
