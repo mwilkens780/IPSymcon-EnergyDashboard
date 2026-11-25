@@ -2,8 +2,12 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/../libs/TileKit.php';
+
 class EnergyDashboard extends IPSModule
 {
+    use \Fuchsbau\TileKit\EnergyDashboard\TileKit;
+
     private const CHART_SPAN_SEC = 6 * 3600;
     private const DIAL_RANGES = [
         'pv_limit' => [0.0, 100.0, 1.0],
@@ -82,8 +86,7 @@ class EnergyDashboard extends IPSModule
     public function Refresh(): void
     {
         try {
-            $data = $this->collectData();
-            $this->pushValue('__all__', $data);
+            $this->tkPush('__all__', $this->ops($this->view($this->collectData())));
             $this->SetStatus(102);
         } catch (\Throwable $e) {
             $this->LogMessage('EnergyDashboard Refresh: ' . $e->getMessage(), KL_ERROR);
@@ -105,7 +108,7 @@ class EnergyDashboard extends IPSModule
                 $targetID = $this->ReadPropertyInteger('var_pv_limit_relative');
                 if ($targetID > 0) {
                     RequestAction($targetID, (float) $Value);
-                    $this->pushValue($Ident, (float) $Value); // optimistic UI update
+                    $this->tkPush($Ident, (float) $Value); // optimistic UI update
                 }
             } catch (\Throwable $e) {
                 $this->LogMessage('EnergyDashboard RequestAction ' . $Ident . ': ' . $e->getMessage(), KL_ERROR);
@@ -116,11 +119,6 @@ class EnergyDashboard extends IPSModule
     }
 
     // ─── Private helpers ──────────────────────────────────────────────────────
-
-    private function pushValue(string $key, $value): void
-    {
-        $this->UpdateVisualizationValue(json_encode(['key' => $key, 'value' => $value]));
-    }
 
     private function readVar(string $prop)
     {
@@ -491,480 +489,227 @@ class EnergyDashboard extends IPSModule
         ];
     }
 
-    // ─── Rendering ──────────────────────────────────────────────────────────────
+    // ─── Rendering (TileKit, siehe docs/ui-kachel.md im Workspace) ─────────────
+    //
+    // view() liefert alle Kacheln inkl. fertig gerenderter Diagramme; daraus
+    // entstehen Erstrender und Live-Push (ops). Die Diagrammlogik existiert
+    // damit nur noch in PHP (frueher doppelt in PHP und JS).
 
-    private function renderStatTile(string $id, string $label, string $value): string
+    private function num($v, int $dec, string $unit): string
     {
-        return "<div class='cur-tile'><span class='cur-label'>{$label}</span><span id=\"{$id}\" class='cur-value'>{$value}</span></div>";
+        return $v === null ? '–' : $this->fmtNum((float) $v, $dec) . $unit;
     }
 
-    private function renderStatusBadge(string $id, string $label, ?bool $active): string
+    private function view(array $d): array
     {
-        if ($active === null) {
-            return '';
+        $bool = static fn (bool $on, string $onText, string $offText, string $onIcon, string $offIcon, string $offState = '') =>
+            ['text' => $on ? $onText : $offText, 'icon' => $on ? $onIcon : $offIcon, 'state' => $on ? 'ok' : $offState];
+        $periods = fn (string $p) => [
+            'Tag'   => ['v' => $d[$p . 'Day'],   'prev' => $d[$p . 'PrevDay']],
+            'Woche' => ['v' => $d[$p . 'Week'],  'prev' => $d[$p . 'PrevWeek']],
+            'Monat' => ['v' => $d[$p . 'Month'], 'prev' => $d[$p . 'PrevMonth']],
+            'Jahr'  => ['v' => $d[$p . 'Year'],  'prev' => $d[$p . 'PrevYear']],
+        ];
+        return [
+            'updated'   => $d['updated'],
+            'online'    => $bool($d['pvOnline'], 'Online', 'Offline', '🟢', '🔴', 'alarm'),
+            'producing' => $bool($d['pvProducing'], 'Produziert', 'Ruht', '☀️', '🌙'),
+            'reachable' => $bool($d['pvReachable'], 'Erreichbar', 'Nicht erreichbar', '📶', '⚠️', 'warn'),
+            'ac'        => $this->num($d['pvPowerAc'], 0, ' W'),
+            'meter'     => $this->num($d['meterPowerCurrent'], 0, ' W'),
+            'pvChart'   => $this->pvChartHtml($d['histPvPower']),
+            'meterChart' => $this->lineChartHtml($d['histMeterPower'], ' W'),
+            'dc'        => $this->num($d['pvPowerDc'], 0, ' W'),
+            'volt'      => $this->num($d['pvVoltage'], 1, ' V'),
+            'amp'       => $this->num($d['pvCurrent'], 1, ' A'),
+            'hz'        => $this->num($d['pvFrequency'], 2, ' Hz'),
+            'eff'       => $this->num($d['pvEfficiency'], 1, ' %'),
+            'temp'      => $this->num($d['pvTemperature'], 1, ' °C'),
+            'total'     => $this->num($d['pvEnergyTotal'], 2, ' kWh'),
+            'meterTotal' => $d['meterEnergyTotal'] !== null ? $this->fmtNum($d['meterEnergyTotal'] / 1000, 1) . ' kWh' : '–',
+            'limit'     => $d['pvLimit'] !== null ? (float) $d['pvLimit'] : null,
+            'daily'     => $this->dailyBarsHtml($d['dailyYield']),
+            'prodBars'  => $this->periodBarsHtml($periods('prod')),
+            'meterBars' => $this->periodBarsHtml($periods('meterUsage')),
+        ];
+    }
+
+    private function ops(array $v): array
+    {
+        $ops = [];
+        foreach (['online', 'producing', 'reachable'] as $k) {
+            array_push($ops, ['t', $k . '_val', $v[$k]['text']], ['t', $k . '_icon', $v[$k]['icon']], ['s', $k, $v[$k]['state']]);
         }
-        $cls  = $active ? 'badge-on' : 'badge-off';
-        $text = htmlspecialchars($label . ($active ? ': an' : ': aus'), ENT_QUOTES);
-        return "<span id=\"{$id}\" class=\"badge {$cls}\">{$text}</span>";
+        foreach (['ac', 'meter', 'dc', 'volt', 'amp', 'hz', 'eff', 'temp', 'total', 'meterTotal'] as $k) {
+            $ops[] = ['t', $k . '_val', $v[$k]];
+        }
+        foreach (['pvChart', 'meterChart', 'daily', 'prodBars', 'meterBars'] as $k) {
+            $ops[] = ['h', $k, $v[$k]];
+        }
+        if ($v['limit'] !== null) {
+            $ops[] = ['d', 'pv_limit', $v['limit']];
+        }
+        return ['updated' => $v['updated'], 'ops' => $ops];
     }
 
-    private function renderMiniChart(string $id, string $label, array $series, string $unit = ''): string
+    /** Solarleistung 6h mit 800-W-Grenze, rot ueber / gruen unter der Grenze (Geometrie: pvChartGeometry). */
+    private function pvChartHtml(array $series): string
     {
-        $chart  = $this->chartData($series);
-        $maxStr = $chart['max'] !== null ? $this->fmtNum($chart['max'], $chart['max'] < 10 ? 1 : 0) . $unit : '';
-        $minStr = $chart['min'] !== null ? $this->fmtNum($chart['min'], $chart['min'] < 10 ? 1 : 0) . $unit : '';
-        return "<div class=\"chart-wrap\"><div class=\"chart-label\">{$label}</div>"
-            . '<div class="chart-inner">'
-            . "<svg id=\"{$id}_svg\" viewBox=\"0 0 300 60\" preserveAspectRatio=\"none\">"
-            . "<polyline id=\"{$id}_poly\" points=\"{$chart['points']}\" fill=\"none\" stroke=\"#7ec8f0\" stroke-width=\"2\"/>"
-            . '</svg>'
-            . "<span id=\"{$id}_max\" class=\"chart-max\">{$maxStr}</span>"
-            . "<span id=\"{$id}_min\" class=\"chart-min\">{$minStr}</span>"
-            . '</div></div>';
-    }
-
-    /** PV power 6h chart with the 800W limit line and red/green segments -- see pvChartGeometry(). */
-    private function renderPvPowerChart(string $id, string $label, array $series): string
-    {
-        $geo    = $this->pvChartGeometry($series);
-        $maxStr = $geo['max'] !== null ? $this->fmtNum($geo['max'], 0) . ' W' : '';
-        $minStr = $geo['min'] !== null ? $this->fmtNum($geo['min'], 0) . ' W' : '';
-
-        $polylines = '';
+        $geo = $this->pvChartGeometry($series);
+        if ($geo['segments'] === []) {
+            return '<span class="tk-hint">Keine Archivdaten</span>';
+        }
+        $lines = '';
         foreach ($geo['segments'] as $seg) {
             $stroke = $seg['color'] === 'red' ? '#e0575a' : '#5ecb82';
-            $polylines .= "<polyline points=\"{$seg['points']}\" fill=\"none\" stroke=\"{$stroke}\" stroke-width=\"2\"/>";
+            $lines .= "<polyline points=\"{$seg['points']}\" fill=\"none\" stroke=\"{$stroke}\" stroke-width=\"2\" vector-effect=\"non-scaling-stroke\"/>";
         }
-        $thresholdLine = $geo['thresholdY'] !== null
-            ? "<line x1=\"0\" y1=\"{$geo['thresholdY']}\" x2=\"300\" y2=\"{$geo['thresholdY']}\" stroke=\"#ffb020\" stroke-width=\"1\" stroke-dasharray=\"4,3\"/>"
-            : '';
-
-        return "<div class=\"chart-wrap\"><div class=\"chart-label\">{$label}</div>"
-            . '<div class="chart-inner">'
-            . "<svg id=\"{$id}_svg\" viewBox=\"0 0 300 60\" preserveAspectRatio=\"none\">"
-            . "{$thresholdLine}<g id=\"{$id}_lines\">{$polylines}</g>"
-            . '</svg>'
-            . "<span id=\"{$id}_max\" class=\"chart-max\">{$maxStr}</span>"
-            . "<span id=\"{$id}_min\" class=\"chart-min\">{$minStr}</span>"
-            . '<span class="chart-limit">800 W Grenze</span>'
-            . '</div></div>';
+        return '<svg viewBox="0 0 300 60" preserveAspectRatio="none">'
+            . "<line x1=\"0\" y1=\"{$geo['thresholdY']}\" x2=\"300\" y2=\"{$geo['thresholdY']}\" stroke=\"#ffb020\" stroke-width=\"1\" stroke-dasharray=\"4,3\" vector-effect=\"non-scaling-stroke\"/>{$lines}</svg>"
+            . '<span class="ch-max">' . $this->fmtNum($geo['max'], 0) . ' W</span><span class="ch-min">' . $this->fmtNum($geo['min'], 0) . ' W</span>'
+            . '<span class="ch-limit">800 W Grenze</span>';
     }
 
-    private function renderDial(string $ident, string $label, ?float $value): string
+    private function lineChartHtml(array $series, string $unit): string
     {
-        [$min, $max, $step] = self::DIAL_RANGES[$ident];
-        $val    = $value ?? $min;
-        [$tx, $ty] = $this->dialThumbPos($val, $min, $max);
-        $valStr = $value !== null ? $this->fmtNum($value, 0) . '%' : '–';
-        $labelEsc = htmlspecialchars($label, ENT_QUOTES);
-
-        return "<div class=\"dial\" data-ident=\"{$ident}\" data-min=\"{$min}\" data-max=\"{$max}\" data-step=\"{$step}\" data-value=\"{$val}\">"
-            . '<svg class="dial-svg" viewBox="0 0 120 120">'
-            . '<path class="dial-track" d="M 28.2 91.8 A 45 45 0 1 1 91.8 91.8" fill="none" stroke="#1e2d40" stroke-width="8" stroke-linecap="round"/>'
-            . "<circle class=\"dial-thumb\" cx=\"{$tx}\" cy=\"{$ty}\" r=\"7\" fill=\"#7ec8f0\"/>"
-            . '</svg>'
-            . "<div class=\"dial-value\">{$valStr}</div>"
-            . "<div class=\"dial-label\">{$labelEsc}</div>"
-            . '</div>';
-    }
-
-    /** $periods: ['Tag' => ['v' => ?float, 'prev' => ?float], 'Woche' => [...], 'Monat' => [...], 'Jahr' => [...]]. */
-    private function renderBarChart(string $label, array $periods): string
-    {
-        $vals     = array_filter(array_map(static fn (array $p) => $p['v'], $periods), static fn ($v) => $v !== null);
-        $localMax = count($vals) > 0 ? max($vals) : 1.0;
-
-        $bars = '';
-        foreach ($periods as $xlabel => $p) {
-            $v       = $p['v'];
-            $prev    = $p['prev'];
-            $h       = $v !== null ? max(2, (int) round(($v / $localMax) * 60)) : 2;
-            $vStr    = $v !== null ? $this->fmtNum($v, 1) : '–';
-            $prevStr = $prev !== null ? '(' . $this->fmtNum($prev, 1) . ')' : '';
-            $bars .= "<div class='bar-col'><div class='bar-value'>{$vStr}</div><div class='bar-prev'>{$prevStr}</div>"
-                . "<div class='bar-track'><div class='bar-fill-v' style='height:{$h}px'></div></div>"
-                . "<div class='bar-xlabel'>{$xlabel}</div></div>";
+        $c = $this->chartData($series);
+        if ($c['points'] === '') {
+            return '<span class="tk-hint">Keine Archivdaten</span>';
         }
-
-        $labelEsc = htmlspecialchars($label, ENT_QUOTES);
-        return "<div class=\"chart-card\"><div class=\"chart-card-label\">{$labelEsc}</div>"
-            . "<div class=\"bar-row\">{$bars}</div></div>";
+        $f = fn (float $v) => $this->fmtNum($v, $v < 10 ? 1 : 0) . $unit;
+        return "<svg viewBox=\"0 0 300 60\" preserveAspectRatio=\"none\"><polyline points=\"{$c['points']}\" fill=\"none\" stroke=\"#7ec8f0\" stroke-width=\"2\" vector-effect=\"non-scaling-stroke\"/></svg>"
+            . '<span class="ch-max">' . $f($c['max']) . '</span><span class="ch-min">' . $f($c['min']) . '</span>';
     }
 
-    /** $series: [{label, value}] -- N columns, no previous-period comparison. */
-    private function renderDailyBarChart(string $label, array $series): string
+    /** Balken je Zeitraum, darunter der Vorperioden-Wert in Klammern. */
+    private function periodBarsHtml(array $periods): string
     {
-        $vals     = array_filter(array_map(static fn (array $p) => $p['value'], $series), static fn ($v) => $v !== null);
-        $localMax = count($vals) > 0 ? max($vals) : 1.0;
+        $vals = array_filter(array_column($periods, 'v'), static fn ($v) => $v !== null);
+        $max  = count($vals) > 0 ? max(max($vals), 0.001) : 1.0;
+        $html = '';
+        foreach ($periods as $label => $p) {
+            $h     = $p['v'] !== null ? max(2, (int) round($p['v'] / $max * 56)) : 2;
+            $prev  = $p['prev'] !== null ? '(' . $this->fmtNum($p['prev'], 1) . ')' : '';
+            $html .= '<div class="bar"><span class="bar-v">' . $this->num($p['v'], 1, '') . "</span><span class=\"tk-sub\">{$prev}</span>"
+                . "<div class=\"bar-track\"><div class=\"bar-fill\" style=\"height:{$h}px\"></div></div><span class=\"tk-sub\">{$label}</span></div>";
+        }
+        return $html;
+    }
 
-        $bars = '';
+    private function dailyBarsHtml(array $series): string
+    {
+        $vals = array_filter(array_column($series, 'value'), static fn ($v) => $v !== null);
+        $max  = count($vals) > 0 ? max(max($vals), 0.001) : 1.0;
+        $html = '';
         foreach ($series as $p) {
-            $v        = $p['value'];
-            $h        = $v !== null ? max(2, (int) round(($v / $localMax) * 60)) : 2;
-            $vStr     = $v !== null ? $this->fmtNum($v, 1) : '–';
-            $labelEsc = htmlspecialchars($p['label'], ENT_QUOTES);
-            $bars .= "<div class='bar-col'><div class='bar-value'>{$vStr}</div>"
-                . "<div class='bar-track'><div class='bar-fill-v' style='height:{$h}px'></div></div>"
-                . "<div class='bar-xlabel'>{$labelEsc}</div></div>";
+            $h     = $p['value'] !== null ? max(2, (int) round($p['value'] / $max * 56)) : 2;
+            $html .= '<div class="bar"><span class="bar-v">' . $this->num($p['value'], 1, '') . '</span>'
+                . "<div class=\"bar-track\"><div class=\"bar-fill\" style=\"height:{$h}px\"></div></div><span class=\"tk-sub\">" . self::tkEsc($p['label']) . '</span></div>';
         }
+        return $html;
+    }
 
-        $labelEsc2 = htmlspecialchars($label, ENT_QUOTES);
-        return "<div class=\"chart-card\"><div class=\"chart-card-label\">{$labelEsc2}</div>"
-            . "<div class=\"bar-row\">{$bars}</div></div>";
+    private function renderLimitDial(?float $value): string
+    {
+        [$min, $max, $step] = self::DIAL_RANGES['pv_limit'];
+        $val       = $value ?? $min;
+        [$tx, $ty] = $this->dialThumbPos($val, $min, $max);
+        $valStr    = $value !== null ? $this->fmtNum($value, 0) . ' %' : '–';
+        return "<div class=\"dial\" data-ident=\"pv_limit\" data-min=\"{$min}\" data-max=\"{$max}\" data-step=\"{$step}\" data-value=\"{$val}\">"
+            . '<svg class="dial-svg" viewBox="0 0 120 120"><path d="M 28.2 91.8 A 45 45 0 1 1 91.8 91.8" fill="none" stroke="#1e2d40" stroke-width="8" stroke-linecap="round"/>'
+            . "<circle class=\"dial-thumb\" cx=\"{$tx}\" cy=\"{$ty}\" r=\"7\" fill=\"#7ec8f0\"/></svg>"
+            . "<div class=\"dial-center\"><span class=\"dial-value\">{$valStr}</span></div></div>";
+    }
+
+    private function chartTile(string $id, string $name, string $valueId, string $value, string $chartHtml): string
+    {
+        return "<div class=\"tk-tile tk-span2 chart-tile\" id=\"{$valueId}_card\"><span class=\"tk-name\">" . self::tkEsc($name) . '</span>'
+            . "<span id=\"{$valueId}_val\" class=\"tk-value\">" . self::tkEsc($value) . "</span><div class=\"chart\" id=\"{$id}\">{$chartHtml}</div><div class=\"ch-x\"><span>-6h</span><span>-3h</span><span>jetzt</span></div></div>";
+    }
+
+    private function barTile(string $id, string $name, string $html, string $cls = 'tk-span2'): string
+    {
+        return "<div class=\"tk-tile {$cls} bars-tile\"><span class=\"tk-name\">" . self::tkEsc($name) . "</span><div class=\"bars\" id=\"{$id}\">{$html}</div></div>";
     }
 
     private function buildDashboardHTML(): string
     {
-        $d = $this->collectData();
+        $v = $this->view($this->collectData());
+        $s = fn (string $k, string $name) => self::tkStatusTile($k, $name, $v[$k]['text'], $v[$k]['icon'], $v[$k]['state']);
+        $t = fn (string $k, string $name) => self::tkValueTile($k, $name, $v[$k]);
 
-        $acStr   = $d['pvPowerAc'] !== null ? $this->fmtNum($d['pvPowerAc'], 0) . ' W' : '–';
-        $dcStr   = $d['pvPowerDc'] !== null ? $this->fmtNum((float) $d['pvPowerDc'], 0) . ' W' : '–';
-        $vStr    = $d['pvVoltage'] !== null ? $this->fmtNum((float) $d['pvVoltage'], 1) . ' V' : '–';
-        $aStr    = $d['pvCurrent'] !== null ? $this->fmtNum((float) $d['pvCurrent'], 1) . ' A' : '–';
-        $hzStr   = $d['pvFrequency'] !== null ? $this->fmtNum((float) $d['pvFrequency'], 2) . ' Hz' : '–';
-        $effStr  = $d['pvEfficiency'] !== null ? $this->fmtNum((float) $d['pvEfficiency'], 1) . ' %' : '–';
-        $tempStr = $d['pvTemperature'] !== null ? $this->fmtNum((float) $d['pvTemperature'], 1) . ' °C' : '–';
-        $totalStr = $d['pvEnergyTotal'] !== null ? $this->fmtNum((float) $d['pvEnergyTotal'], 2) . ' kWh' : '–';
+        $body = self::tkGroup('Leistung')
+            . $this->chartTile('pvChart', 'Solar-Leistung (6 h)', 'ac', $v['ac'], $v['pvChart'])
+            . $this->chartTile('meterChart', 'Netzbezug (6 h)', 'meter', $v['meter'], $v['meterChart'])
+            . $s('online', 'OpenDTU') . $s('producing', 'Wechselrichter') . $s('reachable', 'Verbindung')
+            . self::tkGroup('Solaranlage')
+            . $t('dc', 'Leistung DC') . $t('volt', 'Spannung') . $t('amp', 'Strom') . $t('hz', 'Frequenz')
+            . $t('eff', 'Effizienz') . $t('temp', 'WR-Temperatur') . $t('total', 'Energie gesamt')
+            . '<div class="tk-tile limit-tile"><span class="tk-name">Leistungsbegrenzung</span>' . $this->renderLimitDial($v['limit']) . '</div>'
+            . self::tkGroup('Ertrag & Verbrauch')
+            . $this->barTile('daily', 'Solar – letzte 7 Tage (kWh)', $v['daily'], 'tk-span2 wide-bars')
+            . $this->barTile('prodBars', 'Solar-Produktion (kWh, Vorperiode)', $v['prodBars'])
+            . $this->barTile('meterBars', 'Netzbezug (kWh, Vorperiode)', $v['meterBars'])
+            . $t('meterTotal', 'Zählerstand');
 
-        $meterTotalStr = $d['meterEnergyTotal'] !== null ? $this->fmtNum($d['meterEnergyTotal'] / 1000, 1) . ' kWh' : '–';
-        $meterPowerStr = $d['meterPowerCurrent'] !== null ? $this->fmtNum($d['meterPowerCurrent'], 0) . ' W' : '–';
-
-        $onlineCls  = $d['pvOnline'] ? 'badge-on' : 'badge-off';
-        $onlineText = $d['pvOnline'] ? '📡 OpenDTU online' : '📡 OpenDTU offline';
-
-        $producingBadge = $this->renderStatusBadge('producing_badge', '☀️ Produziert', $d['pvProducing']);
-        $reachableBadge = $this->renderStatusBadge('reachable_badge', '📶 Erreichbar', $d['pvReachable']);
-
-        // Solar-Leistung produziert / Leistung Netzbezug: paired stats + paired 6h charts.
-        $powerStats = $this->renderStatTile('cur_ac', 'Solar-Leistung produziert', $acStr)
-            . $this->renderStatTile('cur_meter_power', 'Leistung Netzbezug', $meterPowerStr);
-        $pvChart    = $this->renderPvPowerChart('chart_pv', 'Solar-Leistung 6h', $d['histPvPower']);
-        $meterChart = $this->renderMiniChart('chart_meter', 'Netzbezug 6h', $d['histMeterPower'], ' W');
-
-        $pvTiles = $this->renderStatTile('cur_dc', 'Leistung DC', $dcStr)
-            . $this->renderStatTile('cur_v', 'Spannung', $vStr)
-            . $this->renderStatTile('cur_a', 'Strom', $aStr)
-            . $this->renderStatTile('cur_hz', 'Frequenz', $hzStr)
-            . $this->renderStatTile('cur_eff', 'Effizienz', $effStr)
-            . $this->renderStatTile('cur_temp', 'WR-Temperatur', $tempStr);
-
-        $pvDial = $this->renderDial('pv_limit', 'Leistungsbegrenzung', $d['pvLimit'] !== null ? (float) $d['pvLimit'] : null);
-        $pvTotalTile = $this->renderStatTile('cur_total', 'Energie gesamt', $totalStr);
-
-        $meterTile = $this->renderStatTile('cur_meter_total', 'Zählerstand gesamt', $meterTotalStr);
-
-        $dailyYieldChart = $this->renderDailyBarChart('Energie heute – letzte 7 Tage (kWh)', $d['dailyYield']);
-
-        $meterBars = $this->renderBarChart('Netzbezug (kWh)', [
-            'Tag'   => ['v' => $d['meterUsageDay'],   'prev' => $d['meterUsagePrevDay']],
-            'Woche' => ['v' => $d['meterUsageWeek'],  'prev' => $d['meterUsagePrevWeek']],
-            'Monat' => ['v' => $d['meterUsageMonth'], 'prev' => $d['meterUsagePrevMonth']],
-            'Jahr'  => ['v' => $d['meterUsageYear'],  'prev' => $d['meterUsagePrevYear']],
-        ]);
-        $prodBars = $this->renderBarChart('Solar-Produktion (kWh)', [
-            'Tag'   => ['v' => $d['prodDay'],   'prev' => $d['prodPrevDay']],
-            'Woche' => ['v' => $d['prodWeek'],  'prev' => $d['prodPrevWeek']],
-            'Monat' => ['v' => $d['prodMonth'], 'prev' => $d['prodPrevMonth']],
-            'Jahr'  => ['v' => $d['prodYear'],  'prev' => $d['prodPrevYear']],
-        ]);
-
-        $updatedEsc = htmlspecialchars($d['updated'], ENT_QUOTES);
-        $initJson   = json_encode($d);
-
-        return <<<HTML
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-html{height:100%}
-*{box-sizing:border-box;margin:0;padding:0}
-body{overflow-y:auto;overflow-x:hidden;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:13px;background:#0d1b2a;color:#d0e8ff;display:flex;flex-direction:column;padding:10px;gap:10px}
-.header{display:flex;justify-content:space-between;align-items:center;gap:6px;font-size:14px;font-weight:600;border-bottom:1px solid #1e3a5f;padding-bottom:6px;flex:none}
-.updated{font-size:10px;color:#3a5a7a;font-weight:400}
-.badge{padding:3px 8px;border-radius:12px;font-size:12px;border:1px solid transparent;white-space:nowrap}
-.badge-off{background:#1a2535;border-color:#2a3a50;color:#4a6a8a}
-.badge-on{background:#12405a;border-color:#2a7aa0;color:#7ec8f0}
-.status-row{display:flex;gap:6px;flex-wrap:wrap;flex:none}
-.section-label{font-size:11px;font-weight:700;color:#8aa8c8;text-transform:uppercase;letter-spacing:.04em;flex:none;border-bottom:1px solid #1e3a5f;padding-bottom:3px}
-.current-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;flex:none}
-.cur-tile{display:flex;flex-direction:column;gap:1px;background:#131f33;border-radius:8px;padding:6px 8px}
-.cur-label{font-size:10px;color:#4a6a8a;text-transform:uppercase;letter-spacing:.03em}
-.cur-value{font-size:15px;font-weight:700;color:#d0e8ff}
-.chart-wrap{flex:none;display:flex;flex-direction:column;gap:2px}
-.chart-label{font-size:9px;color:#4a6a8a;text-transform:uppercase;letter-spacing:.02em}
-.chart-inner{position:relative}
-.chart-inner svg{width:100%;height:40px;background:#131f33;border-radius:6px;display:block}
-.chart-max,.chart-min{position:absolute;right:3px;font-size:8px;color:#7ec8f0;background:rgba(13,27,42,.7);padding:0 3px;border-radius:3px}
-.chart-max{top:2px}
-.chart-min{bottom:2px}
-.chart-limit{position:absolute;left:3px;bottom:2px;font-size:8px;color:#ffb020;background:rgba(13,27,42,.7);padding:0 3px;border-radius:3px}
-.pv-block{display:flex;flex-direction:column;gap:6px;flex:none;background:#0f1c30;border-radius:10px;padding:8px}
-.pv-title{font-size:12px;font-weight:700;color:#d0e8ff}
-.power-stats{display:flex;flex-direction:column;gap:8px}
-.power-charts{display:flex;flex-direction:column;gap:8px}
-.dial-row{display:flex;gap:12px;justify-content:center}
-.dial{display:flex;flex-direction:column;align-items:center;gap:2px;width:100px;touch-action:none}
-.dial-svg{width:80px;height:80px;cursor:pointer}
-.dial-value{font-size:15px;font-weight:700;margin-top:-48px;pointer-events:none}
-.dial-label{font-size:10px;color:#8aa8c8;margin-top:30px}
-.chart-card{background:#131f33;border-radius:8px;padding:6px 8px;display:flex;flex-direction:column;gap:4px}
-.chart-card-label{font-size:11px;font-weight:700;color:#8aa8c8}
-.bar-row{display:flex;justify-content:space-around;align-items:flex-end}
-.bar-col{display:flex;flex-direction:column;align-items:center;gap:2px}
-.bar-value{font-size:10px;font-weight:700;color:#d0e8ff}
-.bar-prev{font-size:8px;font-weight:400;color:#4a6a8a;min-height:10px}
-.bar-track{width:22px;height:60px;display:flex;align-items:flex-end}
-.bar-fill-v{width:100%;background:linear-gradient(180deg,#7ec8f0,#3a8abf);border-radius:3px 3px 0 0;transition:height .4s}
-.bar-xlabel{font-size:9px;color:#4a6a8a}
-.consumption-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;flex:none}
-</style>
-</head>
-<body>
-<div class="header">
-  <span>⚡ Energie <span id="updated" class="updated">Stand {$updatedEsc}</span></span>
-  <span id="online_badge" class="badge {$onlineCls}">{$onlineText}</span>
-</div>
-
-<div class="status-row">{$producingBadge}{$reachableBadge}</div>
-
-<div class="pv-block">
-  <div class="pv-title">⚖️ Leistungsbilanz</div>
-  <div class="power-stats">{$powerStats}</div>
-  <div class="power-charts">
-    {$pvChart}
-    {$meterChart}
-  </div>
-</div>
-
-<div class="pv-block">
-  <div class="pv-title">☀️ Solaranlage</div>
-  <div class="current-grid">{$pvTiles}</div>
-  <div class="current-grid">{$pvTotalTile}</div>
-  <div class="dial-row">{$pvDial}</div>
-</div>
-
-{$dailyYieldChart}
-
-<div class="pv-block">
-  <div class="pv-title">🔌 Stromzähler</div>
-  <div class="current-grid">{$meterTile}</div>
-</div>
-
-<div class="consumption-grid">
-  {$meterBars}
-  {$prodBars}
-</div>
-
-<script>
-(function() {
-  var cs = getComputedStyle(document.body);
-  var vExtra = (parseFloat(cs.marginTop) || 0) + (parseFloat(cs.marginBottom) || 0);
-  document.body.style.height = 'calc(100% - ' + vExtra + 'px)';
-})();
-
-var state = {$initJson};
-var dialRoots = {};
-
-function setText(id, text) {
-  var el = document.getElementById(id);
-  if (el) el.textContent = text;
-}
-
-function renderMiniChart(prefix, series, unit) {
-  var poly = document.getElementById(prefix + '_poly');
-  if (!poly || !series || series.length < 2) return;
-  var spanSec = 6 * 3600;
-  var startTs = Math.floor(Date.now() / 1000) - spanSec;
-  var vals = series.map(function(p) { return p[1]; });
-  var realMin = Math.min.apply(null, vals), realMax = Math.max.apply(null, vals);
-  var min = realMin, max = realMax;
-  if (max - min < 1.0) { var mid = (max + min) / 2; min = mid - 0.5; max = mid + 0.5; }
-  var pad = (max - min) * 0.15; min -= pad; max += pad;
-  var w = 300, h = 60;
-  var pts = series.map(function(p) {
-    var x = Math.max(0, Math.min(w, (p[0] - startTs) / spanSec * w));
-    var y = h - ((p[1] - min) / (max - min)) * h;
-    return x.toFixed(1) + ',' + y.toFixed(1);
-  }).join(' ');
-  poly.setAttribute('points', pts);
-  function fmt(v) { return (v < 10 ? v.toFixed(1) : Math.round(v)).toString().replace('.', ',') + unit; }
-  setText(prefix + '_max', fmt(realMax));
-  setText(prefix + '_min', fmt(realMin));
-}
-
-// Mirrors PHP pvChartGeometry(): 800W-scaled, red/green segments with the crossing point interpolated.
-function renderPvChart(prefix, series) {
-  var g = document.getElementById(prefix + '_lines');
-  if (!g || !series || series.length < 2) return;
-  var LIMIT = 800;
-  var spanSec = 6 * 3600;
-  var startTs = Math.floor(Date.now() / 1000) - spanSec;
-  var vals = series.map(function(p) { return p[1]; });
-  var realMin = Math.min.apply(null, vals), realMax = Math.max.apply(null, vals);
-  var scaleMax = Math.max(realMax, LIMIT) * 1.1;
-  if (scaleMax <= 0) scaleMax = LIMIT * 1.1;
-  var scaleMin = 0;
-
-  function toXY(ts, val) {
-    var x = Math.max(0, Math.min(300, (ts - startTs) / spanSec * 300));
-    var y = 60 - ((val - scaleMin) / (scaleMax - scaleMin)) * 60;
-    return [x, y];
+        $css = <<<'CSS'
+.chart-tile{justify-content:flex-start}
+.chart{position:relative;margin-top:2px;min-height:46px}
+.chart svg{width:100%;height:46px;display:block}
+.ch-max,.ch-min,.ch-limit{position:absolute;font-size:var(--tk-fs-meta);background:rgba(13,27,42,.75);padding:0 3px;border-radius:3px}
+.ch-max{right:2px;top:0;color:var(--tk-accent)}.ch-min{right:2px;bottom:0;color:var(--tk-accent)}.ch-limit{left:2px;bottom:0;color:#ffb020}
+.ch-x{display:flex;justify-content:space-between;font-size:var(--tk-fs-meta);color:var(--tk-dim)}
+.limit-tile{align-items:center}
+.dial{position:relative;width:96px;height:96px;touch-action:none}
+.dial-svg{width:96px;height:96px;display:block;cursor:pointer}
+.dial-center{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
+.dial-value{font-size:16px;font-weight:700}
+.bars-tile{justify-content:flex-start}
+.bars{display:flex;justify-content:space-around;align-items:flex-end;gap:4px;margin-top:4px}
+.bar{display:flex;flex-direction:column;align-items:center;gap:1px;min-width:0}
+.bar-v{font-size:var(--tk-fs-label);font-weight:700}
+.bar-track{width:22px;height:56px;display:flex;align-items:flex-end}
+.bar-fill{width:100%;background:linear-gradient(180deg,#7ec8f0,#3a8abf);border-radius:3px 3px 0 0;transition:height .4s}
+CSS;
+        $js = <<<'JS'
+// Leistungsbegrenzung (Drehregler, schreibt beim Loslassen)
+var dial = (function (root) {
+  if (!root) return null;
+  var svg = root.querySelector('.dial-svg'), thumb = root.querySelector('.dial-thumb'), val = root.querySelector('.dial-value');
+  var min = +root.dataset.min, max = +root.dataset.max, step = +root.dataset.step, cur = +root.dataset.value, drag = false;
+  function show(v) {
+    var f = max > min ? Math.max(0, Math.min(1, (v - min) / (max - min))) : 0, r = (-135 + f * 270) * Math.PI / 180;
+    thumb.setAttribute('cx', (60 + 45 * Math.sin(r)).toFixed(1)); thumb.setAttribute('cy', (60 - 45 * Math.cos(r)).toFixed(1));
+    val.textContent = Math.round(v) + ' %';
   }
-
-  var segments = [];
-  var current = null;
-  for (var i = 0; i < series.length; i++) {
-    var ts = series[i][0], val = series[i][1];
-    var xy = toXY(ts, val);
-    var color = val > LIMIT ? 'red' : 'green';
-    if (current === null) {
-      current = { color: color, pts: [xy] };
-      continue;
-    }
-    if (color !== current.color) {
-      var prevTs = series[i - 1][0], prevVal = series[i - 1][1];
-      var denom = val - prevVal;
-      if (Math.abs(denom) > 1e-9) {
-        var frac = Math.max(0, Math.min(1, (LIMIT - prevVal) / denom));
-        var crossTs = prevTs + frac * (ts - prevTs);
-        var cxy = toXY(crossTs, LIMIT);
-        current.pts.push(cxy);
-        segments.push(current);
-        current = { color: color, pts: [cxy, xy] };
-      } else {
-        segments.push(current);
-        current = { color: color, pts: [xy] };
-      }
-    } else {
-      current.pts.push(xy);
-    }
+  function at(e) {
+    var pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY; var m = svg.getScreenCTM(); if (!m) return;
+    var p = pt.matrixTransform(m.inverse()), a = Math.max(-135, Math.min(135, Math.atan2(p.x - 60, 60 - p.y) * 180 / Math.PI));
+    cur = Math.round((min + (a + 135) / 270 * (max - min)) / step) * step; show(cur);
   }
-  if (current) segments.push(current);
+  svg.addEventListener('pointerdown', function (e) { drag = true; svg.setPointerCapture(e.pointerId); at(e); });
+  svg.addEventListener('pointermove', function (e) { if (drag) at(e); });
+  function end() { if (drag) { drag = false; requestAction('pv_limit', cur); } }
+  svg.addEventListener('pointerup', end); svg.addEventListener('pointercancel', end);
+  return { show: show, busy: function () { return drag; } };
+})(document.querySelector('.dial'));
 
-  var html = '';
-  segments.forEach(function(seg) {
-    var stroke = seg.color === 'red' ? '#e0575a' : '#5ecb82';
-    var pts = seg.pts.map(function(p) { return p[0].toFixed(1) + ',' + p[1].toFixed(1); }).join(' ');
-    html += '<polyline points="' + pts + '" fill="none" stroke="' + stroke + '" stroke-width="2"/>';
+var STATES = ['ok', 'warn', 'alarm'], lastHtml = {};
+tk.on('__all__', function (p) {
+  p.ops.forEach(function (o) {
+    var k = o[0], id = o[1], v = o[2];
+    if (k === 't') tk.setText(id, v);
+    else if (k === 'h') { if (lastHtml[id] !== v) { lastHtml[id] = v; tk.setHtml(id, v); } }
+    else if (k === 'd') { if (dial && !dial.busy()) dial.show(+v); }
+    else if (k === 's') {
+      var card = tk.el(id + '_card'), st = tk.el(id + '_status');
+      if (card) { card.classList.toggle('tk-is-alarm', v === 'alarm'); card.classList.toggle('tk-is-warn', v === 'warn'); }
+      if (st) STATES.forEach(function (s) { st.classList.toggle('tk-' + s, s === v); });
+    }
   });
-  g.innerHTML = html;
-
-  setText(prefix + '_max', Math.round(realMax) + ' W');
-  setText(prefix + '_min', Math.round(realMin) + ' W');
-}
-
-function valueToThumb(value, min, max) {
-  var frac = max > min ? Math.max(0, Math.min(1, (value - min) / (max - min))) : 0;
-  var angleDeg = -135 + frac * 270;
-  var rad = angleDeg * Math.PI / 180;
-  return { x: 60 + 45 * Math.sin(rad), y: 60 - 45 * Math.cos(rad) };
-}
-
-function initDial(root) {
-  var svg = root.querySelector('.dial-svg');
-  var thumb = root.querySelector('.dial-thumb');
-  var valueEl = root.querySelector('.dial-value');
-  var min = parseFloat(root.dataset.min);
-  var max = parseFloat(root.dataset.max);
-  var step = parseFloat(root.dataset.step);
-  var ident = root.dataset.ident;
-  var dragging = false;
-  var currentValue = parseFloat(root.dataset.value);
-
-  function svgPoint(clientX, clientY) {
-    var pt = svg.createSVGPoint();
-    pt.x = clientX; pt.y = clientY;
-    var ctm = svg.getScreenCTM();
-    if (!ctm) return { x: 60, y: 60 };
-    return pt.matrixTransform(ctm.inverse());
-  }
-
-  function updateVisual(value) {
-    var pos = valueToThumb(value, min, max);
-    thumb.setAttribute('cx', pos.x.toFixed(1));
-    thumb.setAttribute('cy', pos.y.toFixed(1));
-    if (valueEl) valueEl.textContent = Math.round(value) + '%';
-  }
-
-  function setFromClient(clientX, clientY) {
-    var p = svgPoint(clientX, clientY);
-    var dx = p.x - 60, dy = p.y - 60;
-    var angleDeg = Math.atan2(dx, -dy) * 180 / Math.PI;
-    angleDeg = Math.max(-135, Math.min(135, angleDeg));
-    var frac = (angleDeg + 135) / 270;
-    var value = min + frac * (max - min);
-    value = Math.round(value / step) * step;
-    currentValue = value;
-    updateVisual(value);
-  }
-
-  svg.addEventListener('pointerdown', function(e) {
-    dragging = true;
-    svg.setPointerCapture(e.pointerId);
-    setFromClient(e.clientX, e.clientY);
-  });
-  svg.addEventListener('pointermove', function(e) {
-    if (dragging) setFromClient(e.clientX, e.clientY);
-  });
-  function endDrag() {
-    if (!dragging) return;
-    dragging = false;
-    requestAction(ident, currentValue);
-  }
-  svg.addEventListener('pointerup', endDrag);
-  svg.addEventListener('pointercancel', endDrag);
-
-  root._updateVisual = updateVisual;
-  dialRoots[ident] = root;
-}
-document.querySelectorAll('.dial').forEach(initDial);
-
-window.handleMessage = function(raw) {
-  var msg = JSON.parse(raw);
-  var key = msg.key, val = msg.value;
-
-  if (key === '__all__') {
-    state = val;
-    setText('updated', 'Stand ' + val.updated);
-    setText('cur_ac', val.pvPowerAc == null ? '–' : Math.round(val.pvPowerAc) + ' W');
-    setText('cur_dc', val.pvPowerDc == null ? '–' : Math.round(val.pvPowerDc) + ' W');
-    setText('cur_v', val.pvVoltage == null ? '–' : val.pvVoltage.toFixed(1).replace('.', ',') + ' V');
-    setText('cur_a', val.pvCurrent == null ? '–' : val.pvCurrent.toFixed(1).replace('.', ',') + ' A');
-    setText('cur_hz', val.pvFrequency == null ? '–' : val.pvFrequency.toFixed(2).replace('.', ',') + ' Hz');
-    setText('cur_eff', val.pvEfficiency == null ? '–' : val.pvEfficiency.toFixed(1).replace('.', ',') + ' %');
-    setText('cur_temp', val.pvTemperature == null ? '–' : val.pvTemperature.toFixed(1).replace('.', ',') + ' °C');
-    setText('cur_total', val.pvEnergyTotal == null ? '–' : val.pvEnergyTotal.toFixed(2).replace('.', ',') + ' kWh');
-    setText('cur_meter_total', val.meterEnergyTotal == null ? '–' : (val.meterEnergyTotal / 1000).toFixed(1).replace('.', ',') + ' kWh');
-    setText('cur_meter_power', val.meterPowerCurrent == null ? '–' : Math.round(val.meterPowerCurrent) + ' W');
-
-    var onlineBadge = document.getElementById('online_badge');
-    if (onlineBadge) {
-      onlineBadge.className = 'badge ' + (val.pvOnline ? 'badge-on' : 'badge-off');
-      onlineBadge.textContent = val.pvOnline ? '📡 OpenDTU online' : '📡 OpenDTU offline';
-    }
-    var producingBadge = document.getElementById('producing_badge');
-    if (producingBadge && val.pvProducing != null) {
-      producingBadge.className = 'badge ' + (val.pvProducing ? 'badge-on' : 'badge-off');
-      producingBadge.textContent = '☀️ Produziert: ' + (val.pvProducing ? 'an' : 'aus');
-    }
-    var reachableBadge = document.getElementById('reachable_badge');
-    if (reachableBadge && val.pvReachable != null) {
-      reachableBadge.className = 'badge ' + (val.pvReachable ? 'badge-on' : 'badge-off');
-      reachableBadge.textContent = '📶 Erreichbar: ' + (val.pvReachable ? 'an' : 'aus');
-    }
-
-    renderPvChart('chart_pv', val.histPvPower);
-    renderMiniChart('chart_meter', val.histMeterPower, ' W');
-
-    if (val.pvLimit != null && dialRoots['pv_limit']) dialRoots['pv_limit']._updateVisual(val.pvLimit);
-  } else if (dialRoots[key]) {
-    dialRoots[key]._updateVisual(val);
-  }
-};
-</script>
-</body>
-</html>
-HTML;
+});
+tk.on('pv_limit', function (v) { if (dial && !dial.busy()) dial.show(+v); });
+JS;
+        return $this->tkPage('Energie', '⚡', $v['updated'], "<div class=\"tk-grid\">{$body}</div>", $css, $js, 'null');
     }
 }
